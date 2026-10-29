@@ -46,7 +46,8 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "weather_journal.db"
 #: ``(description, [(sql, params), ...])`` tuple describing one migration
 #: step.  Index 0 is version 1 (the earliest shipped schema, a.k.a. the
 #: beginning-of-manifest version); index 1 is version 2 (the data migration
-#: that links legacy weather rows to explicit locations).
+#: that links legacy weather rows to explicit locations); index 2 is version 3
+#: (immutable per-observation location labels and aliases).
 SCHEMA_VERSIONS = [
     # Version 1: the bootstrap schema.  Creates the two tables the application
     # has always shipped.  ``entries.location_id`` is created up front for new
@@ -110,6 +111,26 @@ SCHEMA_VERSIONS = [
             ),
         ],
     ),
+    # Version 3: shared location rows cannot represent how each individual
+    # observation was requested.  Snapshot the request name and display label
+    # on every entry, backfilling existing history with the best metadata that
+    # remains available on its location.
+    (
+        "preserve per-observation location labels",
+        [
+            ("ALTER TABLE entries ADD COLUMN requested_name TEXT;", ()),
+            ("ALTER TABLE entries ADD COLUMN location_label TEXT;", ()),
+            (
+                "UPDATE entries SET"
+                " requested_name = (SELECT requested_name FROM locations"
+                "                   WHERE id = entries.location_id),"
+                " location_label = (SELECT location_label FROM locations"
+                "                   WHERE id = entries.location_id)"
+                " WHERE requested_name IS NULL OR location_label IS NULL;",
+                (),
+            ),
+        ],
+    ),
 ]
 
 #: Latest schema version the application can apply.
@@ -162,16 +183,17 @@ def _apply_migration_step(conn, index):
             return False
 
         for statement, params in statements:
-            if statement.startswith("ALTER TABLE entries ADD COLUMN location_id"):
-                # Skip when the column already exists so the step stays
-                # idempotent across fresh databases (CREATE included it) and
-                # legacy databases that already carry the column.
+            if statement.startswith("ALTER TABLE entries ADD COLUMN "):
+                # Skip when the column already exists so migration steps stay
+                # idempotent for databases whose schema is ahead of their
+                # user_version (including interrupted older releases).
                 if _table_exists(conn, "entries"):
                     columns = {
                         row["name"]
                         for row in conn.execute("PRAGMA table_info(entries)")
                     }
-                    if "location_id" in columns:
+                    column = statement.split("ADD COLUMN ", 1)[1].split()[0]
+                    if column in columns:
                         continue
             conn.execute(statement, params or ())
         _set_schema_version(conn, target_version)
@@ -311,10 +333,11 @@ def _get_or_create_location(conn, city, location):
         provider, provider_id, city, requested_name, country,
         latitude, longitude, label,
     ))
-    return conn.execute(
+    location_id = conn.execute(
         "SELECT id FROM locations WHERE provider = ? AND provider_id = ?",
         (provider, provider_id),
     ).fetchone()["id"]
+    return location_id, requested_name, label
 
 
 def save_entry(city, temp, humidity, condition, logged_at=None,
@@ -322,13 +345,19 @@ def save_entry(city, temp, humidity, condition, logged_at=None,
     """Save a weather observation with a stable location identity."""
     conn = get_connection(db_path)
     try:
-        location_id = _get_or_create_location(conn, city, location)
+        location_id, requested_name, location_label = _get_or_create_location(
+            conn, city, location
+        )
         ts = logged_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("""
             INSERT INTO entries
-                (city, temp, humidity, condition, logged_at, location_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (city, temp, humidity, condition, ts, location_id))
+                (city, temp, humidity, condition, logged_at, location_id,
+                 requested_name, location_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            city, temp, humidity, condition, ts, location_id,
+            requested_name, location_label,
+        ))
         conn.commit()
     finally:
         conn.close()
@@ -343,13 +372,22 @@ def _matching_locations(conn, selector):
         """, (provider_selector,)).fetchall()
     else:
         rows = conn.execute("""
-            SELECT * FROM locations
-            WHERE LOWER(location_label) = LOWER(?)
-               OR LOWER(requested_name) = LOWER(?)
-               OR LOWER(name) = LOWER(?)
-               OR (provider = 'manual' AND LOWER(location_label || ' [manual]') = LOWER(?))
-            ORDER BY location_label
-        """, (selector, selector, selector, selector)).fetchall()
+            SELECT DISTINCT l.* FROM locations AS l
+            LEFT JOIN entries AS e ON e.location_id = l.id
+            WHERE LOWER(l.location_label) = LOWER(?)
+               OR LOWER(l.requested_name) = LOWER(?)
+               OR LOWER(l.name) = LOWER(?)
+               OR LOWER(e.location_label) = LOWER(?)
+               OR LOWER(e.requested_name) = LOWER(?)
+               OR (l.provider = 'manual' AND (
+                       LOWER(l.location_label || ' [manual]') = LOWER(?)
+                    OR LOWER(e.location_label || ' [manual]') = LOWER(?)
+               ))
+            ORDER BY l.location_label
+        """, (
+            selector, selector, selector, selector, selector,
+            selector, selector,
+        )).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -371,7 +409,7 @@ def get_history(city=None, db_path=DEFAULT_DB_PATH):
         rows = conn.execute(f"""
             SELECT e.city, e.temp, e.humidity, e.condition, e.logged_at,
                    l.provider, l.provider_id, l.country, l.latitude,
-                   l.longitude, l.location_label
+                   l.longitude, e.requested_name, e.location_label
             FROM entries AS e
             JOIN locations AS l ON l.id = e.location_id
             {where}

@@ -4,11 +4,12 @@ These tests exercise real rollback and retry behaviour rather than merely
 checking that initialization succeeds.  No live weather API or external
 network access is used; databases are created in temporary paths.
 
-The supported schema has two versions so the tests can exercise multiple
+The supported schema has three versions so the tests can exercise multiple
 historical schema versions (a requirement of issue #30):
 
 * version 1 - the bootstrap schema (``locations`` and ``entries`` tables).
 * version 2 - the data migration that links legacy rows to locations.
+* version 3 - immutable request names and labels on individual observations.
 """
 
 import sqlite3

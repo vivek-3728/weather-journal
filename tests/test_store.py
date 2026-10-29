@@ -64,6 +64,34 @@ class TestLocationIdentity(unittest.TestCase):
         self.assertEqual([entry["temp"] for entry in illinois], [10.0])
         self.assertEqual([entry["temp"] for entry in missouri], [30.0])
 
+    def test_aliases_preserve_historical_labels_and_remain_selectable(self):
+        first_location = {
+            "provider": "openweathermap",
+            "provider_id": 2643743,
+            "requested_name": "London,UK",
+            "country": "GB",
+            "latitude": 51.5072,
+            "longitude": -0.1276,
+        }
+        second_location = dict(first_location, requested_name="London,GB")
+
+        save_entry(
+            "London", 10.0, 50, "clear sky", db_path=self.db_path,
+            location=first_location,
+        )
+        save_entry(
+            "London", 20.0, 55, "few clouds", db_path=self.db_path,
+            location=second_location,
+        )
+
+        original_alias = get_history("London,UK", db_path=self.db_path)
+        newer_alias = get_history("London,GB", db_path=self.db_path)
+
+        self.assertEqual([entry["temp"] for entry in original_alias], [20.0, 10.0])
+        self.assertEqual([entry["temp"] for entry in newer_alias], [20.0, 10.0])
+        self.assertTrue(original_alias[0]["location_label"].startswith("London,GB"))
+        self.assertTrue(original_alias[1]["location_label"].startswith("London,UK"))
+
     def test_old_database_rows_are_preserved_as_legacy_location(self):
         conn = sqlite3.connect(str(self.db_path))
         conn.execute("""
