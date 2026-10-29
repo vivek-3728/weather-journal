@@ -739,6 +739,43 @@ class TestThreadCoordination(_CoordTestBase):
         self.assertEqual(row_after[1], newer_observed)
 
     @patch("weather_journal.fetch.requests.get")
+    def test_stale_fetch_returns_newer_persisted_result(self, mock_get):
+        """A rejected stale response must not escape to the caller."""
+        from weather_journal import fetch
+
+        now = time.time()
+        newer = {
+            "city": "London",
+            "temp": 21.0,
+            "humidity": 60,
+            "condition": "clear sky",
+            "location": {
+                "provider": "openweathermap",
+                "provider_id": 2643743,
+                "requested_name": "London",
+                "country": "GB",
+                "latitude": 51.5,
+                "longitude": -0.12,
+                "dt": now,
+            },
+        }
+        fetch._write_cache(
+            "london", newer, self.cache_path, now, now
+        )
+
+        # Simulate an original lease owner finishing late with an older API
+        # observation after a replacement owner persisted ``newer``.
+        mock_get.return_value = self._weather_response(10.0, dt=now - 100)
+        result = fetch._fetch_and_store(
+            "London", "london", self.cache_path, "fake-key"
+        )
+
+        self.assertEqual(result["temp"], 21.0)
+        row = self._stored_row()
+        self.assertEqual(json.loads(row[2])["temp"], 21.0)
+        self.assertEqual(row[0], now)
+
+    @patch("weather_journal.fetch.requests.get")
     def test_stale_write_does_not_replace_newer_memory_entry(self, mock_get):
         """Memory keeps the freshest observation after a rejected stale write."""
         from weather_journal import fetch

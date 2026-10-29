@@ -170,6 +170,10 @@ def _write_cache(city_key, data, cache_path, fetched_at, observed_at):
     carries the same observation moment.  ``observed_at IS NULL`` (pre-#31
     rows) means "no ordering known" and always loses, so the write payload is
     stored for reads while its ``fetched_at`` stamp still orders freshness.
+
+    Return the payload that won the ordering race.  Callers must use this
+    value rather than their local response because a newer observation may
+    have been committed by another process while their request was in flight.
     """
     payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
     conn = _connect_cache(cache_path)
@@ -195,12 +199,12 @@ def _write_cache(city_key, data, cache_path, fetched_at, observed_at):
     # memory, so a rejected stale write never replaces a newer in-memory entry
     # and memory agrees with the winning persisted row.
     now = _now()
-    winner = _sqlite_winner(city_key, cache_path, (fetched_at, data, observed_at), now)
-    if winner[1] is not data:
-        data = winner[1]
-        observed_at = winner[2]
+    fetched_at, data, observed_at = _sqlite_winner(
+        city_key, cache_path, (fetched_at, data, observed_at), now
+    )
     if observed_at > _memory_observed_at(city_key, cache_path):
         _cache[_memory_key(city_key, cache_path)] = (fetched_at, data, observed_at)
+    return data
 
 
 def _memory_observed_at(city_key, cache_path):
@@ -441,5 +445,4 @@ def _fetch_and_store(city, city_key, cache_path, key):
         raise ValueError(f"Malformed API response payload: {exc}")
 
     observed_at = _observation_order(data, city, request_started_at)
-    _write_cache(city_key, result, cache_path, _now(), observed_at)
-    return result
+    return _write_cache(city_key, result, cache_path, _now(), observed_at)
